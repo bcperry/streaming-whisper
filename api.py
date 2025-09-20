@@ -3,6 +3,10 @@ from fastapi.responses import HTMLResponse
 import numpy as np
 import io
 import logging
+import os
+import json
+from datetime import datetime
+from pathlib import Path
 from TTS import MicWhisper
 
 # Configure logging
@@ -210,6 +214,112 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+# Configuration for transcription storage
+TRANSCRIPTION_STORAGE_DIR = "transcriptions"
+# Ensure transcription storage directory exists
+Path(TRANSCRIPTION_STORAGE_DIR).mkdir(exist_ok=True)
+
+def asses_and_act(client_id: int, text: str):
+    """
+    Function to assess the transcription text and perform actions.
+    This function will call the action agent to determine if the primary agent needs to be invoked.
+    Args:
+        client_id: The ID of the client that generated the transcription
+        text: The final transcription text
+    """
+    logger.info(f"Assessing transcription for client {client_id}: {text}")
+    # Example action: Log the text length
+    
+
+async def handle_final_transcription(client_id: int, text: str):
+    """
+    Handle final transcription text for a client.
+    Calls the Agent to perform the appropriate action based on the transcription.
+    Then calls the helper method to save the transcription to a file.
+
+    Args:
+        client_id: The ID of the client that generated the transcription
+        text: The final transcription text
+    """
+    logger.info(f"Handling final transcription for client {client_id}: {text}")
+    # Call the helper method to save the transcription
+    await save_to_file(client_id, text)
+    asses_and_act(client_id, text)
+    
+
+
+
+async def save_to_file(client_id: int, text: str):
+    """
+    Handle final transcription text for a client.
+    Saves the transcription to a client-specific JSON file with timestamp.
+    
+    Args:
+        client_id: The ID of the client that generated the transcription
+        text: The final transcription text
+    """
+    logger.info(f"Processing final transcription for client {client_id}: {text}")
+    
+    try:
+        # Create filename based on client ID
+        filename = f"{client_id}.json"
+        filepath = Path(TRANSCRIPTION_STORAGE_DIR) / filename
+        
+        # Prepare the transcription entry with timestamp
+        timestamp = datetime.now().isoformat()
+        
+        # Load existing data or create new structure
+        data = {
+            "all_text": "",
+            "utterances": []
+        }
+        
+        if filepath.exists():
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                # Ensure structure exists for backward compatibility
+                if "all_text" not in data:
+                    data["all_text"] = ""
+                if "utterances" not in data:
+                    data["utterances"] = []
+            except (json.JSONDecodeError, Exception) as e:
+                logger.warning(f"Could not read existing transcriptions for client {client_id}: {e}")
+                data = {
+                    "all_text": "",
+                    "utterances": []
+                }
+        
+        # Create new utterance entry
+        new_utterance = {
+            "timestamp": timestamp,
+            "text": text
+        }
+        
+        # Append to utterances
+        data["utterances"].append(new_utterance)
+        
+        # Append to all_text with space separator (if not first utterance)
+        if data["all_text"]:
+            data["all_text"] += " " + text
+        else:
+            data["all_text"] = text
+        
+        # Save back to file
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"Saved transcription for client {client_id} to {filepath}")
+        
+    except Exception as e:
+        logger.error(f"Error saving transcription for client {client_id}: {e}")
+    
+    # Future enhancement: Add cloud storage support here
+    # This could be extended to also save to Azure Blob Storage, AWS S3, etc.
+    # Example structure:
+    # if CLOUD_STORAGE_ENABLED:
+    #     await save_to_cloud_storage(client_id, text, timestamp)
+
 @app.get("/")
 async def get():
     return HTMLResponse(html)
@@ -230,6 +340,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: int):
         prefix = "[final]" if is_final else "[interim]"
         logger.info(f"Sending transcription to client {client_id}: {prefix} {text}")
         try:
+            # Call helper method for final transcriptions
+            if is_final:
+                await handle_final_transcription(client_id, text)
             await manager.send_personal_message(f"{prefix} {text}", websocket)
         except Exception as e:
             logger.error(f"Error sending transcription to client {client_id}: {e}")

@@ -38,6 +38,10 @@ PRESPEECH_BUFFER_SEC = float(os.getenv("WHISPER_PRESPEECH_BUFFER_SEC", "0.3"))  
 # Interim transcription parameters
 INTERIM_TRANSCRIBE_FRAMES = int(os.getenv("WHISPER_INTERIM_FRAMES", "30"))  # frames between interim transcriptions
 
+# Length-based finalization parameters
+MAX_UTTERANCE_FRAMES = int(os.getenv("WHISPER_MAX_UTTERANCE_FRAMES", "480"))  # ~15 seconds at 16kHz/512 blocks
+MAX_INTERIM_COUNT = int(os.getenv("WHISPER_MAX_INTERIM_COUNT", "5"))  # max interim transcriptions before forcing final
+
 # Whisper model config
 MODEL_NAME = os.getenv("WHISPER_MODEL", "tiny.en")  # e.g., tiny, base, small, medium, large-v3
 DEVICE = os.getenv("WHISPER_DEVICE", "auto")  # cpu or cuda
@@ -51,6 +55,8 @@ class UtteranceState:
     speech_frames: int = 0
     silence_frames: int = 0
     frames_since_last_interim: int = 0
+    total_frames: int = 0  # total frames collected in current utterance
+    interim_count: int = 0  # number of interim transcriptions done
     current_chunks: List[np.ndarray] = None
     last_interim_text: str = ""
 
@@ -80,6 +86,19 @@ class MicWhisper:
             return False
         return text.rstrip()[-1:] in '.!?'
 
+    def _should_finalize_on_natural_break(self, current_text: str, previous_text: str) -> bool:
+        """Check if we should finalize based on natural break detection"""
+        if not current_text or not previous_text:
+            return False
+        
+        # If current text ends with sentence punctuation and is significantly different from previous
+        if self._ends_with_sentence_punctuation(current_text):
+            # Check if this is a natural completion (not just a small addition)
+            word_diff = len(current_text.split()) - len(previous_text.split())
+            return word_diff >= 2  # At least 2 new words to consider it a natural break
+        
+        return False
+
     async def _transcribe_async(self, audio: np.ndarray, is_final: bool = False):
         # Run transcription off the audio thread
         segments, _info = await asyncio.get_running_loop().run_in_executor(
@@ -104,10 +123,20 @@ class MicWhisper:
                 logger.info(f"[final] {text}")
                 return text, True
             else:
+                # Check for natural break finalization
+                should_finalize = self._should_finalize_on_natural_break(text, self.state.last_interim_text)
+                
                 # Only print interim results if text is different AND ends with sentence punctuation
                 if text != self.state.last_interim_text and self._ends_with_sentence_punctuation(text):
-                    logger.debug(f"{text}")
+                    logger.debug(f"[interim] {text}")
                     self.state.last_interim_text = text
+                    self.state.interim_count += 1
+                    
+                    # Check if we should finalize due to natural break
+                    if should_finalize:
+                        logger.info(f"[final via natural break] {text}")
+                        return text, True
+                    
                     return text, False
         return None, is_final
 
@@ -140,6 +169,8 @@ class MicWhisper:
                     self.state.current_chunks.append(block)
                     self.state.silence_frames = 0
                     self.state.frames_since_last_interim = 0
+                    self.state.total_frames = len(self.state.current_chunks)  # include prespeech in count
+                    self.state.interim_count = 0
                     # reset prespeech buffer for next time
                     self.prespeech_buffer.clear()
             else:
@@ -151,6 +182,13 @@ class MicWhisper:
             # collecting
             self.state.current_chunks.append(block)
             self.state.frames_since_last_interim += 1
+            self.state.total_frames += 1
+            
+            # Check for length-based finalization
+            should_finalize_length = (
+                self.state.total_frames >= MAX_UTTERANCE_FRAMES or 
+                self.state.interim_count >= MAX_INTERIM_COUNT
+            )
             
             if is_speech:
                 self.state.silence_frames = 0
@@ -159,15 +197,39 @@ class MicWhisper:
                 if self.state.frames_since_last_interim >= INTERIM_TRANSCRIBE_FRAMES:
                     audio = np.concatenate(self.state.current_chunks).astype(np.float32)
                     self.state.frames_since_last_interim = 0
-                    # schedule interim transcription
-                    asyncio.run_coroutine_threadsafe(
-                        self._transcribe_and_callback(audio, is_final=False), 
-                        self.loop
-                    )
+                    
+                    if should_finalize_length:
+                        # Force final transcription due to length limits
+                        logger.info(f"Forcing final transcription due to length limits (frames: {self.state.total_frames}, interims: {self.state.interim_count})")
+                        asyncio.run_coroutine_threadsafe(
+                            self._transcribe_and_callback(audio, is_final=True), 
+                            self.loop
+                        )
+                        # reset state after scheduling transcription
+                        self.state = UtteranceState()
+                        logger.debug("Reset state after length-based final transcription - ready for new utterance")
+                    else:
+                        # schedule interim transcription
+                        asyncio.run_coroutine_threadsafe(
+                            self._transcribe_and_callback(audio, is_final=False), 
+                            self.loop
+                        )
             else:
                 self.state.silence_frames += 1
                 logger.debug(f"Silence in utterance, frames: {self.state.silence_frames}/{VAD_MAX_SILENCE_FRAMES}")
-                if self.state.silence_frames >= VAD_MAX_SILENCE_FRAMES:
+                
+                # Force finalization if we hit length limits, even with some silence
+                if should_finalize_length:
+                    logger.info(f"Forcing final transcription due to length limits during silence (frames: {self.state.total_frames}, interims: {self.state.interim_count})")
+                    audio = np.concatenate(self.state.current_chunks).astype(np.float32)
+                    asyncio.run_coroutine_threadsafe(
+                        self._transcribe_and_callback(audio, is_final=True), 
+                        self.loop
+                    )
+                    # reset state after scheduling transcription
+                    self.state = UtteranceState()
+                    logger.debug("Reset state after length-based final transcription during silence - ready for new utterance")
+                elif self.state.silence_frames >= VAD_MAX_SILENCE_FRAMES:
                     # End of utterance - this is final
                     logger.info(f"Ending utterance after {self.state.silence_frames} silence frames")
                     audio = np.concatenate(self.state.current_chunks).astype(np.float32)
@@ -184,8 +246,14 @@ class MicWhisper:
         """Combined transcription and callback to avoid Future handling issues"""
         try:
             result = await self._transcribe_async(audio, is_final)
-            if result and result[0] and self.transcription_callback:
-                await self.transcription_callback(result[0], result[1])
+            if result and result[0]:
+                # If natural break detection triggered a final transcription, reset state
+                if result[1] and not is_final:  # result[1] is True (final) but is_final was False (natural break)
+                    logger.debug("Natural break detected - resetting state for new utterance")
+                    self.state = UtteranceState()
+                
+                if self.transcription_callback:
+                    await self.transcription_callback(result[0], result[1])
         except Exception as e:
             logger.error(f"Error in transcription callback: {e}")
 
