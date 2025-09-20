@@ -3,24 +3,24 @@ from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 import numpy as np
 import io
-import logging
 import os
 import json
 from datetime import datetime
 from pathlib import Path
 from transcription import MicWhisper
-from src.config import storage_settings, logging_settings
-
-# Configure logging
-logging.basicConfig(
-    level=getattr(logging, logging_settings.level.upper()),
-    format=logging_settings.format,
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(logging_settings.api_log_file)
-    ]
+from src.config import storage_settings
+from src.utils.logging import (
+    get_application_logger, 
+    configure_application_logging,
+    error_handler,
+    WebSocketError,
+    TranscriptionError,
+    log_exception
 )
-logger = logging.getLogger(__name__)
+
+# Configure structured logging
+configure_application_logging()
+logger = get_application_logger('api')
 
 app = FastAPI()
 
@@ -119,8 +119,16 @@ async def save_to_file(client_id: int, text: str):
                     data["all_text"] = ""
                 if "utterances" not in data:
                     data["utterances"] = []
-            except (json.JSONDecodeError, Exception) as e:
-                logger.warning(f"Could not read existing transcriptions for client {client_id}: {e}")
+            except json.JSONDecodeError as e:
+                log_exception(logger, e, component="file_storage", client_id=client_id)
+                logger.warning(f"Invalid JSON in transcription file for client {client_id}, creating new file")
+                data = {
+                    "all_text": "",
+                    "utterances": []
+                }
+            except (OSError, IOError) as e:
+                log_exception(logger, e, component="file_storage", client_id=client_id)
+                logger.warning(f"Could not read transcription file for client {client_id}: {e}")
                 data = {
                     "all_text": "",
                     "utterances": []
@@ -147,8 +155,12 @@ async def save_to_file(client_id: int, text: str):
         
         logger.info(f"Saved transcription for client {client_id} to {filepath}")
         
-    except Exception as e:
-        logger.error(f"Error saving transcription for client {client_id}: {e}")
+    except (OSError, IOError) as e:
+        log_exception(logger, e, component="file_storage", client_id=client_id)
+        raise WebSocketError(f"Failed to save transcription for client {client_id}: {str(e)}") from e
+    except json.JSONEncodeError as e:
+        log_exception(logger, e, component="file_storage", client_id=client_id)
+        raise WebSocketError(f"Failed to encode transcription data for client {client_id}: {str(e)}") from e
     
     # Future enhancement: Add cloud storage support here
     # This could be extended to also save to Azure Blob Storage, AWS S3, etc.
@@ -180,8 +192,16 @@ async def websocket_endpoint(websocket: WebSocket, client_id: int):
             if is_final:
                 await handle_final_transcription(client_id, text)
             await manager.send_personal_message(f"{prefix} {text}", websocket)
+        except WebSocketError:
+            # Re-raise WebSocket errors as they're already properly logged
+            raise
+        except TranscriptionError as e:
+            log_exception(logger, e, component="transcription_callback", client_id=client_id)
+            # Don't break the connection for transcription errors
+            await manager.send_personal_message(f"[error] Transcription failed: {str(e)}", websocket)
         except Exception as e:
-            logger.error(f"Error sending transcription to client {client_id}: {e}")
+            log_exception(logger, e, component="websocket_send", client_id=client_id)
+            raise WebSocketError(f"Failed to send transcription to client {client_id}: {str(e)}") from e
     
     # Store callback for this client and create a new transcriber instance
     client_callbacks[client_id] = send_transcription
@@ -223,19 +243,42 @@ async def websocket_endpoint(websocket: WebSocket, client_id: int):
                     client_transcriber.on_input(audio_data)
                     # Transcription results will be sent via the callback
 
-                except Exception as e:
+                except (ValueError, TypeError) as e:
+                    log_exception(logger, e, component="audio_processing", client_id=client_id)
                     try:
                         await manager.send_personal_message(
-                            f"[server] error processing audio: {str(e)}", websocket
+                            f"[server] Invalid audio data format: {str(e)}", websocket
+                        )
+                    except:
+                        # Don't let send errors break the main loop
+                        pass
+                except TranscriptionError as e:
+                    log_exception(logger, e, component="audio_processing", client_id=client_id)
+                    try:
+                        await manager.send_personal_message(
+                            f"[server] Transcription error: {str(e)}", websocket
+                        )
+                    except:
+                        # Don't let send errors break the main loop
+                        pass
+                except Exception as e:
+                    log_exception(logger, e, component="audio_processing", client_id=client_id)
+                    try:
+                        await manager.send_personal_message(
+                            f"[server] Error processing audio: {str(e)}", websocket
                         )
                     except:
                         # WebSocket might be closed, ignore error
                         pass
             # Ignore other message types (pings, etc.)
     except WebSocketDisconnect:
-        pass
+        logger.info(f"Client {client_id} disconnected normally")
+    except WebSocketError as e:
+        log_exception(logger, e, component="websocket_main", client_id=client_id)
+        # WebSocket errors are already properly logged, don't re-raise
     except Exception as e:
-        logger.error(f"WebSocket error for client {client_id}: {e}")
+        log_exception(logger, e, component="websocket_main", client_id=client_id)
+        logger.error(f"Unexpected error in WebSocket connection for client {client_id}: {e}")
     finally:
         # Clean up transcription callback when client disconnects
         if client_id in client_callbacks:

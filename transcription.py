@@ -1,6 +1,5 @@
 import asyncio
 import os
-import logging
 from dataclasses import dataclass
 from typing import Deque, List, Optional
 
@@ -9,18 +8,18 @@ import sounddevice as sd
 from collections import deque
 
 from faster_whisper import WhisperModel
-from src.config import audio_settings, vad_settings, whisper_settings, transcription_settings, logging_settings
-
-# Configure logging
-logging.basicConfig(
-    level=getattr(logging, logging_settings.level.upper()),
-    format=logging_settings.format,
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(logging_settings.transcription_log_file)
-    ]
+from src.config import audio_settings, vad_settings, whisper_settings, transcription_settings
+from src.utils.logging import (
+    get_application_logger, 
+    configure_application_logging,
+    error_handler,
+    TranscriptionError,
+    log_exception
 )
-logger = logging.getLogger(__name__)
+
+# Configure structured logging
+configure_application_logging()
+logger = get_application_logger('transcription')
 
 
 @dataclass
@@ -115,8 +114,8 @@ class MicWhisper:
             return (text, actual_is_final)
 
         except Exception as e:
-            logger.error(f"Transcription error: {e}")
-            return None
+            log_exception(logger, e, component="transcription")
+            raise TranscriptionError(f"Transcription failed: {str(e)}") from e
 
     def on_input(self, block: np.ndarray):
         """Called by the audio callback for each block."""
@@ -230,8 +229,12 @@ class MicWhisper:
                 
                 if self.transcription_callback:
                     await self.transcription_callback(result[0], result[1])
+        except TranscriptionError:
+            # Re-raise transcription errors as they're already properly logged
+            raise
         except Exception as e:
-            logger.error(f"Error in transcription callback: {e}")
+            log_exception(logger, e, component="transcription_callback")
+            raise TranscriptionError(f"Transcription callback failed: {str(e)}") from e
 
     async def run(self):
         logger.info("Mic ready. Speak into your microphone. Press Ctrl+C to stop.")
