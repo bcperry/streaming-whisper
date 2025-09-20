@@ -15,6 +15,7 @@ class AudioSettings(BaseSettings):
     sample_rate: int = Field(default=16000, description="Audio sample rate in Hz")
     channels: int = Field(default=1, description="Number of audio channels (mono=1)")
     block_size: int = Field(default=512, description="Audio processing block size in frames")
+    dtype: str = Field(default="float32", description="Audio data type for sounddevice")
     
     class Config:
         env_prefix = "WHISPER_AUDIO_"
@@ -25,7 +26,9 @@ class VADSettings(BaseSettings):
     energy_threshold: float = Field(default=0.001, description="RMS energy threshold for speech detection")
     min_speech_frames: int = Field(default=3, description="Minimum consecutive speech frames to start recording")
     max_silence_frames: int = Field(default=15, description="Maximum silence frames before ending utterance")
+    silence_frames_threshold: int = Field(default=15, description="Silence frames threshold for utterance end")
     prespeech_buffer_sec: float = Field(default=0.3, description="Pre-speech buffer duration in seconds")
+    buffer_max_length: int = Field(default=480, description="Maximum audio buffer length in frames")
     
     class Config:
         env_prefix = "WHISPER_VAD_"
@@ -33,10 +36,11 @@ class VADSettings(BaseSettings):
 
 class WhisperSettings(BaseSettings):
     """Whisper model configuration"""
-    model_name: str = Field(default="tiny.en", description="Whisper model name (tiny, base, small, medium, large-v3)")
+    model: str = Field(default="tiny.en", description="Whisper model name (tiny, base, small, medium, large-v3)")
     device: str = Field(default="auto", description="Processing device (auto, cpu, cuda)")
     compute_type: str = Field(default="int8", description="Compute precision (int8, float16, float32)")
     language: str = Field(default="en", description="Language code for transcription")
+    beam_size: int = Field(default=5, description="Beam size for transcription search")
     
     class Config:
         env_prefix = "WHISPER_MODEL_"
@@ -44,9 +48,10 @@ class WhisperSettings(BaseSettings):
 
 class TranscriptionSettings(BaseSettings):
     """Transcription processing configuration"""
-    interim_frames: int = Field(default=30, description="Frames between interim transcriptions")
+    interim_frame_interval: int = Field(default=15, description="Interval between interim transcriptions")
     max_utterance_frames: int = Field(default=480, description="Maximum frames per utterance (~15 seconds)")
     max_interim_count: int = Field(default=5, description="Maximum interim transcriptions before forcing final")
+    natural_break_threshold: int = Field(default=100, description="Text length threshold for natural break detection")
     
     class Config:
         env_prefix = "WHISPER_TRANSCRIPTION_"
@@ -121,4 +126,5 @@ whisper_settings = settings.whisper
 transcription_settings = settings.transcription
 storage_settings = settings.storage
 logging_settings = settings.logging
+server_settings = settings.server
 server_settings = settings.server
