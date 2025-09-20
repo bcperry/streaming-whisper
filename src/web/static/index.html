@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>WebSocket Audio + Text Demo</title>
+    <style>
+        body { font-family: system-ui, Arial, sans-serif; margin: 1.5rem; }
+        #status { font-size: .9rem; color: #555; }
+        button { margin-right: .5rem; }
+        #messages { list-style: none; padding-left: 0; }
+        #messages li { padding: 2px 4px; border-bottom: 1px solid #eee; font-family: monospace; }
+        .audio { color: #0a6; }
+        .error { color: #c00; }
+    </style>
+</head>
+<body>
+    <h1>WebSocket Audio + Text Demo</h1>
+    <h2>Client ID: <span id="ws-id"></span></h2>
+
+    <section>
+        <h3>Text Chat</h3>
+        <form onsubmit="sendMessage(event)">
+            <input type="text" id="messageText" autocomplete="off" placeholder="Type a message..." />
+            <button type="submit">Send</button>
+        </form>
+    </section>
+
+    <section>
+        <h3>Microphone Streaming</h3>
+        <div id="audio-controls">
+            <button id="startBtn" type="button">Start Mic</button>
+            <button id="stopBtn" type="button" disabled>Stop Mic</button>
+        </div>
+        <div id="status">Idle</div>
+        <p style="max-width:680px;font-size:.85rem;">This page requests microphone access, records short Opus chunks (MediaRecorder) and sends them as binary WebSocket messages. The server currently just acknowledges receipt. Open DevTools Network panel to inspect frame traffic.</p>
+    </section>
+
+    <h3>Messages</h3>
+    <ul id="messages"></ul>
+
+    <script>
+        const clientId = Date.now();
+        document.getElementById('ws-id').textContent = clientId;
+
+        // Use the current host dynamically (supports non-localhost / https)
+        const wsProto = (location.protocol === 'https:') ? 'wss' : 'ws';
+        const ws = new WebSocket(`${wsProto}://${location.host}/ws/${clientId}`);
+
+        const messagesEl = document.getElementById('messages');
+        const statusEl = document.getElementById('status');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+
+        function addMessage(text, cls) {
+            const li = document.createElement('li');
+            if (cls) li.className = cls;
+            li.textContent = text;
+            messagesEl.appendChild(li);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
+
+        ws.addEventListener('open', () => addMessage('[ws] connected'));
+        ws.addEventListener('close', () => addMessage('[ws] closed', 'error'));
+        ws.addEventListener('error', (e) => addMessage('[ws] error', 'error'));
+        ws.addEventListener('message', ev => {
+            addMessage(ev.data);
+        });
+
+        function sendMessage(ev) {
+            ev.preventDefault();
+            const input = document.getElementById('messageText');
+            if (input.value.trim()) ws.send(input.value.trim());
+            input.value = '';
+        }
+
+        // --- Microphone streaming ---
+        let audioContext = null;
+        let sourceNode = null;
+        let processorNode = null;
+        let audioStream = null;
+        let chunkCount = 0;
+
+        async function startMic() {
+            if (audioContext) return; // already running
+            try {
+                audioStream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        sampleRate: 16000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true
+                    }
+                });
+            } catch (err) {
+                addMessage('Microphone permission denied: ' + err, 'error');
+                return;
+            }
+
+            audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                sampleRate: 16000
+            });
+            
+            sourceNode = audioContext.createMediaStreamSource(audioStream);
+            
+            // Create a ScriptProcessorNode to capture raw PCM data
+            const bufferSize = 4096; // ~256ms at 16kHz
+            processorNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
+            
+            processorNode.onaudioprocess = function(event) {
+                if (ws.readyState === WebSocket.OPEN) {
+                    const inputBuffer = event.inputBuffer;
+                    const channelData = inputBuffer.getChannelData(0); // mono
+                    
+                    // Convert Float32Array to ArrayBuffer
+                    const buffer = new ArrayBuffer(channelData.length * 4); // 4 bytes per float32
+                    const view = new Float32Array(buffer);
+                    view.set(channelData);
+                    
+                    chunkCount++;
+                    ws.send(buffer); // send raw PCM as binary
+                }
+            };
+            
+            sourceNode.connect(processorNode);
+            processorNode.connect(audioContext.destination);
+
+            addMessage('[audio] Raw PCM streaming started (16kHz mono)');
+            statusEl.textContent = 'Streaming...';
+            startBtn.disabled = true;
+            stopBtn.disabled = false;
+        }
+
+        function stopMic() {
+            if (!audioContext) return;
+            
+            if (processorNode) {
+                processorNode.disconnect();
+                processorNode = null;
+            }
+            if (sourceNode) {
+                sourceNode.disconnect();
+                sourceNode = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            if (audioStream) {
+                audioStream.getTracks().forEach(t => t.stop());
+                audioStream = null;
+            }
+            
+            statusEl.textContent = 'Idle';
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+        }
+
+        startBtn.addEventListener('click', startMic);
+        stopBtn.addEventListener('click', stopMic);
+
+        // Expose for console debugging (optional)
+        window.__ws = ws;
+    </script>
+</body>
+</html>

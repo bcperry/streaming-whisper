@@ -9,44 +9,18 @@ import sounddevice as sd
 from collections import deque
 
 from faster_whisper import WhisperModel
+from src.config import audio_settings, vad_settings, whisper_settings, transcription_settings, logging_settings
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=getattr(logging, logging_settings.level.upper()),
+    format=logging_settings.format,
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('tts.log')
+        logging.FileHandler(logging_settings.transcription_log_file)
     ]
 )
 logger = logging.getLogger(__name__)
-
-
-# ==========================
-# Config
-# ==========================
-SAMPLE_RATE = int(os.getenv("WHISPER_SAMPLE_RATE", "16000"))
-CHANNELS = 1
-BLOCK_SIZE = int(os.getenv("WHISPER_BLOCK_SIZE", "512"))  # frames per callback
-
-# VAD parameters (very simple energy-based VAD)
-VAD_ENERGY_THRESHOLD = float(os.getenv("WHISPER_VAD_RMS_THRESH", "0.001"))  
-VAD_MIN_SPEECH_FRAMES = int(os.getenv("WHISPER_VAD_MIN_SPEECH_FRAMES", "3"))  # ~3 * block (reduced from 5)
-VAD_MAX_SILENCE_FRAMES = int(os.getenv("WHISPER_VAD_MAX_SILENCE_FRAMES", "15"))  # end utterance (reduced from 20)
-PRESPEECH_BUFFER_SEC = float(os.getenv("WHISPER_PRESPEECH_BUFFER_SEC", "0.3"))  # pad before start
-
-# Interim transcription parameters
-INTERIM_TRANSCRIBE_FRAMES = int(os.getenv("WHISPER_INTERIM_FRAMES", "30"))  # frames between interim transcriptions
-
-# Length-based finalization parameters
-MAX_UTTERANCE_FRAMES = int(os.getenv("WHISPER_MAX_UTTERANCE_FRAMES", "480"))  # ~15 seconds at 16kHz/512 blocks
-MAX_INTERIM_COUNT = int(os.getenv("WHISPER_MAX_INTERIM_COUNT", "5"))  # max interim transcriptions before forcing final
-
-# Whisper model config
-MODEL_NAME = os.getenv("WHISPER_MODEL", "tiny.en")  # e.g., tiny, base, small, medium, large-v3
-DEVICE = os.getenv("WHISPER_DEVICE", "auto")  # cpu or cuda
-COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")  # int8, float16, float32
-LANGUAGE = os.getenv("WHISPER_LANGUAGE", "en")
 
 
 @dataclass
@@ -66,11 +40,11 @@ class UtteranceState:
 
 class MicWhisper:
     def __init__(self):
-        logger.info(f"Loading Whisper model '{MODEL_NAME}' on {DEVICE} (compute_type={COMPUTE_TYPE})...")
-        self.model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE)
+        logger.info(f"Loading Whisper model '{whisper_settings.model_name}' on {whisper_settings.device} (compute_type={whisper_settings.compute_type})...")
+        self.model = WhisperModel(whisper_settings.model_name, device=whisper_settings.device, compute_type=whisper_settings.compute_type)
         self.loop = asyncio.get_event_loop()
 
-        self.prespeech_frames = int(PRESPEECH_BUFFER_SEC * SAMPLE_RATE / BLOCK_SIZE)
+        self.prespeech_frames = int(vad_settings.prespeech_buffer_sec * audio_settings.sample_rate / audio_settings.block_size)
         self.prespeech_buffer: Deque[np.ndarray] = deque(maxlen=max(self.prespeech_frames, 1))
         self.state = UtteranceState()
         self.transcription_callback = None
@@ -99,54 +73,56 @@ class MicWhisper:
         
         return False
 
-    async def _transcribe_async(self, audio: np.ndarray, is_final: bool = False):
-        # Run transcription off the audio thread
-        segments, _info = await asyncio.get_running_loop().run_in_executor(
-            None,
-            lambda: self.model.transcribe(
-                audio,
-                beam_size=1,
-                language=LANGUAGE,
-                vad_filter=False,  # we already segmented
-                without_timestamps=False,
-            ),
-        )
+    async def _transcribe_async(self, audio: np.ndarray, is_final: bool = False) -> Optional[tuple[str, bool]]:
+        try:
+            # Whisper expects (samples,) shape
+            if audio.ndim > 1:
+                audio = audio.flatten()
 
-        text_parts = []
-        for seg in segments:
-            # seg.text already stripped
-            if seg.text:
-                text_parts.append(seg.text)
-        text = " ".join(text_parts).strip()
-        if text:
-            if is_final:
-                logger.info(f"[final] {text}")
-                return text, True
+            # Transcribe
+            segments, _ = self.model.transcribe(
+                audio, 
+                beam_size=1, 
+                language=whisper_settings.language,
+                without_timestamps=True,
+                vad_filter=False,  # we already did VAD
+                condition_on_previous_text=False
+            )
+
+            # Extract text
+            text = " ".join(segment.text for segment in segments).strip()
+            
+            if not text:
+                return None
+
+            # Determine if this should be considered final
+            actual_is_final = is_final
+            
+            # Check for natural break detection only for interim transcriptions
+            if not is_final and self.state.last_interim_text:
+                if self._should_finalize_on_natural_break(text, self.state.last_interim_text):
+                    logger.info(f"Natural break detected: '{text}' (was: '{self.state.last_interim_text}')")
+                    actual_is_final = True
+            
+            # Update state for interim transcriptions
+            if not actual_is_final:
+                self.state.last_interim_text = text
+                self.state.interim_count += 1
+                logger.debug(f"Interim transcription #{self.state.interim_count}: '{text}'")
             else:
-                # Check for natural break finalization
-                should_finalize = self._should_finalize_on_natural_break(text, self.state.last_interim_text)
-                
-                # Only print interim results if text is different AND ends with sentence punctuation
-                if text != self.state.last_interim_text and self._ends_with_sentence_punctuation(text):
-                    logger.debug(f"[interim] {text}")
-                    self.state.last_interim_text = text
-                    self.state.interim_count += 1
-                    
-                    # Check if we should finalize due to natural break
-                    if should_finalize:
-                        logger.info(f"[final via natural break] {text}")
-                        return text, True
-                    
-                    return text, False
-        return None, is_final
+                logger.info(f"Final transcription: '{text}'")
 
-    def on_input(self, indata: np.ndarray):
-        # indata is float32 [-1,1], shape (frames, channels)
-        if indata.ndim == 2 and indata.shape[1] > 1:
-            # Mixdown to mono
-            block = np.mean(indata, axis=1, dtype=np.float32)
-        else:
-            block = indata.reshape(-1).astype(np.float32)
+            return (text, actual_is_final)
+
+        except Exception as e:
+            logger.error(f"Transcription error: {e}")
+            return None
+
+    def on_input(self, block: np.ndarray):
+        """Called by the audio callback for each block."""
+        # block is shape (512, 1) typically
+        if block.ndim > 1:
+            block = block[:, 0]  # take first channel
 
         # downsample/ensure 16kHz if needed (sounddevice already configured to 16kHz)
 
@@ -155,13 +131,13 @@ class MicWhisper:
 
         # VAD
         energy = self._rms(block)
-        is_speech = energy >= VAD_ENERGY_THRESHOLD
+        is_speech = energy >= vad_settings.energy_threshold
 
         if not self.state.collecting:
             if is_speech:
                 self.state.speech_frames += 1
-                logger.debug(f"Speech detected, frames: {self.state.speech_frames}/{VAD_MIN_SPEECH_FRAMES}")
-                if self.state.speech_frames >= VAD_MIN_SPEECH_FRAMES:
+                logger.debug(f"Speech detected, frames: {self.state.speech_frames}/{vad_settings.min_speech_frames}")
+                if self.state.speech_frames >= vad_settings.min_speech_frames:
                     # Start collecting: include prespeech
                     logger.info(f"Starting new utterance collection (energy: {energy:.4f})")
                     self.state.collecting = True
@@ -186,15 +162,15 @@ class MicWhisper:
             
             # Check for length-based finalization
             should_finalize_length = (
-                self.state.total_frames >= MAX_UTTERANCE_FRAMES or 
-                self.state.interim_count >= MAX_INTERIM_COUNT
+                self.state.total_frames >= transcription_settings.max_utterance_frames or 
+                self.state.interim_count >= transcription_settings.max_interim_count
             )
             
             if is_speech:
                 self.state.silence_frames = 0
                 
                 # Check if we should do an interim transcription
-                if self.state.frames_since_last_interim >= INTERIM_TRANSCRIBE_FRAMES:
+                if self.state.frames_since_last_interim >= transcription_settings.interim_frames:
                     audio = np.concatenate(self.state.current_chunks).astype(np.float32)
                     self.state.frames_since_last_interim = 0
                     
@@ -216,7 +192,7 @@ class MicWhisper:
                         )
             else:
                 self.state.silence_frames += 1
-                logger.debug(f"Silence in utterance, frames: {self.state.silence_frames}/{VAD_MAX_SILENCE_FRAMES}")
+                logger.debug(f"Silence in utterance, frames: {self.state.silence_frames}/{vad_settings.max_silence_frames}")
                 
                 # Force finalization if we hit length limits, even with some silence
                 if should_finalize_length:
@@ -229,7 +205,7 @@ class MicWhisper:
                     # reset state after scheduling transcription
                     self.state = UtteranceState()
                     logger.debug("Reset state after length-based final transcription during silence - ready for new utterance")
-                elif self.state.silence_frames >= VAD_MAX_SILENCE_FRAMES:
+                elif self.state.silence_frames >= vad_settings.max_silence_frames:
                     # End of utterance - this is final
                     logger.info(f"Ending utterance after {self.state.silence_frames} silence frames")
                     audio = np.concatenate(self.state.current_chunks).astype(np.float32)
@@ -266,9 +242,9 @@ class MicWhisper:
             self.on_input(indata)
 
         with sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            blocksize=BLOCK_SIZE,
-            channels=CHANNELS,
+            samplerate=audio_settings.sample_rate,
+            blocksize=audio_settings.block_size,
+            channels=audio_settings.channels,
             dtype="float32",
             callback=callback,
         ):
