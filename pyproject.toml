@@ -12,6 +12,7 @@ dependencies = [
     "pydub>=0.25.1",
     "semantic-kernel[mcp]>=1.36.0",
     "pydantic-settings>=2.0.0",
+    "ollama>=0.5.4",
 ]
 
 [dependency-groups]

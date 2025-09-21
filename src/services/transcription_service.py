@@ -192,12 +192,10 @@ class TranscriptionStorageService:
         """
         client_ids = []
         
-        for file_path in self.transcriptions_dir.glob("transcription_*.json"):
-            # Extract client ID from filename
+        for file_path in self.transcriptions_dir.glob("*.json"):
+            # Extract client ID from filename (filename is the client ID)
             filename = file_path.stem  # Remove .json extension
-            if filename.startswith("transcription_"):
-                client_id = filename[len("transcription_"):]
-                client_ids.append(client_id)
+            client_ids.append(filename)
         
         return sorted(client_ids)
     
