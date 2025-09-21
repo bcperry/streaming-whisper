@@ -63,7 +63,9 @@ class Action_Agent:
         self.mcp_server = None
         self.chat_completion = None
         self.execution_settings = None
-        self.history = ChatHistory(system_message="you summarize text and decide if action is needed")
+        self.history = ChatHistory(system_message="you review text and decide if action is needed. " \
+        "you should always use your tools to get a name from that tool, " \
+        "then respond with the name you retrieved with  and '<somename>: action required' or '<somename>: no action required'")
 
     async def connect_mcp(self):
         """Connect to the MCP server"""
@@ -90,7 +92,8 @@ class Action_Agent:
 
         # Add Ollama chat completion
         self.chat_completion = OllamaChatCompletion(
-            ai_model_id="qwen3:0.6b",
+            # ai_model_id="qwen3:0.6b",
+            ai_model_id="gpt-oss:20b",
             host="http://ollama.home",
         )
 
