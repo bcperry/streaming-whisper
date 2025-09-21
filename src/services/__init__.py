@@ -2,9 +2,12 @@
 
 from .websocket_manager import ConnectionManager, TranscriptionWebSocketManager
 from .transcription_service import TranscriptionStorageService
+from .agent_service import AgentService, agent_service
 
 __all__ = [
     "ConnectionManager",
     "TranscriptionWebSocketManager",
-    "TranscriptionStorageService"
+    "TranscriptionStorageService",
+    "AgentService",
+    "agent_service"
 ]
