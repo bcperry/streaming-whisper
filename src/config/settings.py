@@ -9,6 +9,13 @@ from typing import Literal
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
+# Check CUDA availability at module load
+try:
+    import torch
+    _cuda_available = torch.cuda.is_available()
+except ImportError:
+    _cuda_available = False
+
 
 class AudioSettings(BaseSettings):
     """Audio processing configuration"""
@@ -33,9 +40,18 @@ class VADSettings(BaseSettings):
 
 class WhisperSettings(BaseSettings):
     """Whisper model configuration"""
-    model_name: str = Field(default="tiny.en", description="Whisper model name (tiny, base, small, medium, large-v3)")
-    device: str = Field(default="auto", description="Processing device (auto, cpu, cuda)")
-    compute_type: str = Field(default="int8", description="Compute precision (int8, float16, float32)")
+    model_name: str = Field(
+        default="large-v3" if _cuda_available else "tiny.en", 
+        description="Whisper model name (tiny, base, small, medium, large-v3)"
+    )
+    device: str = Field(
+        default="cuda" if _cuda_available else "auto", 
+        description="Processing device (auto, cpu, cuda)"
+    )
+    compute_type: str = Field(
+        default="float16" if _cuda_available else "int8", 
+        description="Compute precision (int8, float16, float32)"
+    )
     language: str = Field(default="en", description="Language code for transcription")
     
     class Config:
