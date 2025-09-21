@@ -43,7 +43,7 @@ class AgentSettings(BaseSettings):
         default_factory=lambda: {
             "default": AgentConfig(
                 name="default",
-                model_id="gpt-oss:20b",
+                model_id="phi4-mini:latest",
                 host="http://ollama.home",
                 system_prompt="You are a helpful assistant.",
                 mcp_servers=[]

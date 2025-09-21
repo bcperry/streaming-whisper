@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse
 from src.core.transcription import MicWhisper
 from src.services.websocket_manager import ConnectionManager, TranscriptionWebSocketManager
 from src.services.transcription_service import TranscriptionStorageService
+from src.services.agent_service import AgentService
 from src.utils.logging import (
     get_application_logger,
     WebSocketError,
@@ -47,6 +48,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: Optional[str] = No
             # Save final transcriptions to storage
             if is_final:
                 await storage_service.save_final_transcription(client_id, text)
+                
             
             # Send to client via WebSocket
             await transcription_ws_manager.send_transcription_result(client_id, text, is_final)
