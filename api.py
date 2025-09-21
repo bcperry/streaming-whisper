@@ -8,6 +8,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from transcription import MicWhisper
+from src.core.agent import Action_Agent
 from src.config import storage_settings
 from src.utils.logging import (
     get_application_logger, 
@@ -50,12 +51,13 @@ class ConnectionManager:
             await connection.send_text(message)
 
 manager = ConnectionManager()
+action_agent = Action_Agent()
 
 # Configuration for transcription storage
 # Ensure transcription storage directory exists
 Path(storage_settings.transcription_dir).mkdir(exist_ok=True)
 
-def asses_and_act(client_id: int, text: str):
+async def asses_and_act(client_id: int, text: str):
     """
     Function to assess the transcription text and perform actions.
     This function will call the action agent to determine if the primary agent needs to be invoked.
@@ -64,7 +66,9 @@ def asses_and_act(client_id: int, text: str):
         text: The final transcription text
     """
     logger.info(f"Assessing transcription for client {client_id}: {text}")
-    # Example action: Log the text length
+    response = await action_agent.review_text(text=text)
+    logger.info(f"Agent says: {response}")
+    return response
 
 
 async def handle_final_transcription(client_id: int, text: str):
@@ -80,10 +84,8 @@ async def handle_final_transcription(client_id: int, text: str):
     logger.info(f"Handling final transcription for client {client_id}: {text}")
     # Call the helper method to save the transcription
     await save_to_file(client_id, text)
-    asses_and_act(client_id, text)
+    return await asses_and_act(client_id, text)
     
-
-
 
 async def save_to_file(client_id: int, text: str):
     """
@@ -189,9 +191,11 @@ async def websocket_endpoint(websocket: WebSocket, client_id: int):
         logger.info(f"Sending transcription to client {client_id}: {prefix} {text}")
         try:
             # Call helper method for final transcriptions
-            if is_final:
-                await handle_final_transcription(client_id, text)
             await manager.send_personal_message(f"{prefix} {text}", websocket)
+
+            if is_final:
+                agent_response = await handle_final_transcription(client_id, text)
+                await manager.send_personal_message(f"[Agent Response] {agent_response}", websocket)
         except WebSocketError:
             # Re-raise WebSocket errors as they're already properly logged
             raise

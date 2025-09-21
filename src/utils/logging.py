@@ -113,16 +113,26 @@ class StreamingWhisperLogger:
         
     def _configure_module_loggers(self, api_handler: logging.Handler, transcription_handler: logging.Handler) -> None:
         """Configure specific module loggers with appropriate handlers."""
-        # API module logger - only logs to API file and console
+        # Create console handler for module loggers
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(StructuredFormatter(
+            fmt="%(asctime)s | %(levelname)-8s | %(component)-12s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        ))
+        console_handler.setLevel(getattr(logging, self.settings.level.upper(), logging.INFO))
+        
+        # API module logger - logs to API file and console
         api_logger = logging.getLogger('api')
         api_logger.handlers.clear()
         api_logger.addHandler(api_handler)
+        api_logger.addHandler(console_handler)
         api_logger.propagate = False  # Don't propagate to root
         
-        # Transcription module logger - only logs to transcription file and console  
+        # Transcription module logger - logs to transcription file and console  
         transcription_logger = logging.getLogger('transcription')
         transcription_logger.handlers.clear()
         transcription_logger.addHandler(transcription_handler)
+        transcription_logger.addHandler(console_handler)
         transcription_logger.propagate = False  # Don't propagate to root
         
         # Store configured loggers
